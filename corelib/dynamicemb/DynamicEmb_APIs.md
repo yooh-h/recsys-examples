@@ -7,6 +7,7 @@ This document consists of two parts, one is the introduction to the API, which c
 - [DynamicEmbParameterConstraints](#dynamicembparameterconstraints)
 - [DynamicEmbeddingEnumerator](#dynamicembeddingenumerator)
 - [DynamicEmbeddingShardingPlanner](#dynamicembeddingshardingplanner)
+- [Sharding planner](#sharding-planner)
 - [DynamicEmbeddingCollectionSharder](#dynamicembeddingcollectionsharder)
 - [DynamicEmbCheckMode](#dynamicembcheckmode)
 - [DynamicEmbInitializerMode](#dynamicembinitializermode)
@@ -86,7 +87,17 @@ The `DynamicEmbeddingEnumerator` function inherits from TorchREC's `EmbeddingEnu
 
 ## DynamicEmbeddingShardingPlanner
 
-Wrapped TorchREC's `EmbeddingShardingPlanner` to perform sharding for dynamic embedding tables. Unlike `EmbeddingShardingPlanner`, it requires an additional eb\_configs parameter to plan the capacity of dynamic embedding tables.
+Wrapped TorchREC's `EmbeddingShardingPlanner` to perform sharding for dynamic embedding tables. Unlike `EmbeddingShardingPlanner`, it requires an additional `eb_configs` argument so DynamicEmb can derive per-rank capacities and bucket widths from the global `EmbeddingConfig` and the process-group world size.
+
+On construction it runs the internal preparation step described under [Sharding planner](#sharding-planner), then builds the TorchREC sub-planner and DynamicEmb shard metadata as before.
+
+For row-wise DynamicEmb sharding, the supported `dist_type` values are:
+
+- `continuous`
+- `roundrobin`
+- `hash_roundrobin`
+
+`hash_roundrobin` hashes the raw key before rank assignment and is intended to reduce sensitivity to pathological raw-key patterns that can break plain modulo-based `roundrobin`. It is an opt-in routing mode; the default remains `roundrobin` for compatibility with existing checkpoints. It should be understood as a routing robustness improvement, not as a general solution to arbitrary hot-key or Zipf-skew load balancing.
 
     ```python
     #How to import
@@ -108,11 +119,9 @@ Wrapped TorchREC's `EmbeddingShardingPlanner` to perform sharding for dynamic em
         debug: bool = True):
 
         """
-        DynamicEmbeddingShardingPlanner wraps the API of EmbeddingShardingPlanner from the Torchrec repo,
-        giving it the ability to plan dynamic embedding tables. The only difference from EmbeddingShardingPlanner
-        is that DynamicEmbeddingShardingPlanner has an additional parameter `eb_configs`, which is a list of
-        TorchREC BaseEmbeddingConfig. This is because the dynamic embedding table needs to re-plan the number of
-        embedding vectors on each rank to align with DEMB_TABLE_ALIGN_SIZE.
+        DynamicEmbeddingShardingPlanner wraps EmbeddingShardingPlanner and adds `eb_configs` (TorchREC
+        table configs) so per-rank DynamicEmb options can be filled before planning. See the
+        "Sharding planner" section in DynamicEmb_APIs.md for how `DynamicEmbTableOptions` are adjusted.
 
         Parameters
         ----------
@@ -148,6 +157,31 @@ Wrapped TorchREC's `EmbeddingShardingPlanner` to perform sharding for dynamic em
             A flag indicating whether to enable debug mode. Defaults to True.
         """
     ```
+
+## Sharding planner
+
+When you construct `DynamicEmbeddingShardingPlanner`, the implementation first validates that `constraints` and `eb_configs` are consistent (every `EmbeddingCollection` / table name appears exactly once in `eb_configs`, matches the keys of `constraints`, and there are no extra keys). Then, **for each table with** `DynamicEmbParameterConstraints.use_dynamicemb == True`, it updates that table’s `DynamicEmbTableOptions` in **`dynamicemb_options`** via the internal routine `_prepare_dynemb_table_options` (order matters):
+
+| Step | Field(s) | What happens |
+|------|-----------|----------------|
+| 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
+| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
+| 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / world_size)`** so each rank gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). |
+
+**User-supplied values that should be set before planning** (typical DMP path) include at least:
+
+- **`global_hbm_for_values`**: global HBM byte budget for the table’s values; the planner only splits it across ranks.
+- **`bucket_capacity`**: requested hashtable bucket size in rows (see rules above), or `MAX_BUCKET_CAPACITY` for “single bucket per rank table”.
+- **`initializer_args`**: optional partial bounds for `UNIFORM`; missing bounds are completed as in step 1.
+
+**Downstream (after planning, when modules are built):** the batched embedding path uses **`max_capacity`** from **`DynamicEmbTableOptions`** (e.g. allocation size and consistency checks against TorchREC shard row counts in `_get_dynamicemb_options_per_table` in `batched_dynamicemb_compute_kernel.py`).
+
+**Public helpers** (same rules as the planner):
+
+- `from dynamicemb.dynamicemb_config import complete_initializer_args` (initializer completion; not re-exported from `dynamicemb` top-level today)
+- `from dynamicemb import get_sharded_table_capacity` — returns **per-rank row capacity** after sharding and bucket alignment (``num_buckets * effective_bucket_width``), matching **`max_capacity`** set by the planner. With **`MAX_BUCKET_CAPACITY`**, the table is one bucket per rank whose width is the aligned shard row count.
+- `from dynamicemb import get_table_value_bytes` — total bytes for **all ranks**’ value storage (embedding + optimizer state rows), using the same row layout as `get_sharded_table_capacity` for the given `bucket_capacity` (including **`MAX_BUCKET_CAPACITY`**). Use this to size **`global_hbm_for_values`** before planning; apply your own **caching** fraction or **HBM budget scale** on top if needed (as in benchmarks / examples).
+- `from dynamicemb import BUCKET_ALIGNMENT, MAX_BUCKET_CAPACITY`
 
 ## DynamicEmbeddingCollectionSharder
 
@@ -303,11 +337,18 @@ dynamicemb provides the following strategies to set the score.
         CUSTOMIZED:
             Each embedding table's score are managed by users.
             Users have to set the score before every forward pass using `set_score` interface.
+        LFU:
+            If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+        NO_EVICTION:
+            The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
+            When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
         """
 
         TIMESTAMP = 0
         STEP = 1
         CUSTOMIZED = 2
+        LFU = 3
+        NO_EVICTION = 4
     ```
 
     Users can specify the `DynamicEmbScoreStrategy` using `score_strategy` in `DynamicEmbTableOptions` per table.
@@ -347,7 +388,9 @@ All pooling modes use fused CUDA kernels for both forward and backward passes. T
 
 ## DynamicEmbTableOptions
 
-Dynamic embedding table parameter class, used to configure the parameters for each dynamic embedding table, to be input into `DynamicEmbParameterConstraints`.
+Per-table configuration for dynamic embedding, passed into `DynamicEmbParameterConstraints` as `dynamicemb_options`. The authoritative definition lives in `dynamicemb.dynamicemb_config.DynamicEmbTableOptions` (this section mirrors its docstring).
+
+Fields declared first (through `device_id`) are **planner/runtime-heavy**: `DynamicEmbeddingShardingPlanner` fills them via `_prepare_dynemb_table_options` together with internal `_sharded_table_bucket_layout` (and thus the same per-rank row count as `get_sharded_table_capacity`). User-facing knobs such as `training`, `bucket_capacity`, `global_hbm_for_values`, and `initializer_args` follow. Hash-table **scores** are driven by `score_strategy` and kernels, not by a separate score-dtype field on this dataclass.
 
     ```python
     #How to import
@@ -355,25 +398,54 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
 
     #API arguments
     @dataclass
-    class DynamicEmbTableOptions(_ContextOptions):
+    class DynamicEmbTableOptions:
         """
         Encapsulates the configuration options for dynamic embedding table.
 
-        This class include parameters that control the behavior and performance of embedding lookup module, specifically tailored for dynamic embeddings.
+        This class includes parameters that control the behavior and performance of the embedding lookup module, specifically tailored for dynamic embeddings.
         `get_grouped_key` will return fields used to group dynamic embedding tables.
+
+        Fields listed first (through ``device_id``) are often filled by the planner or runtime rather than
+        being the main user configuration knobs. Score handling for the hash table follows score
+        policies and kernels, not a separate score-dtype field on this dataclass.
 
         Parameters
         ----------
+        embedding_dtype : Optional[torch.dtype], optional
+            Data (weight) type of dynamic embedding table.
+        dim : Optional[int], optional
+            Value vector dimension. With ``DynamicEmbeddingShardingPlanner``, ``_prepare_dynemb_table_options``
+            sets it from ``BaseEmbeddingConfig.embedding_dim``. The embedding kernel only warns if it
+            differs from the sharded ``local_cols`` (see ``_get_dynamicemb_options_per_table``).
+        max_capacity : Optional[int], optional
+            Per-shard maximum table rows on one GPU. With ``DynamicEmbeddingShardingPlanner``,
+            ``_prepare_dynemb_table_options`` sets ``max_capacity`` to
+            per-rank row count from ``get_sharded_table_capacity``.
+            You may omit ``max_capacity`` on ``DynamicEmbTableOptions`` before planning and let the planner set it.
+            If ``init_capacity`` is unset it becomes ``max_capacity``; if set and aligned,
+            it is clamped to at most ``max_capacity``.
+            The embedding kernel checks consistency with TorchREC shard metadata (see
+            ``_get_dynamicemb_options_per_table``).
+        evict_strategy : DynamicEmbEvictStrategy
+            Strategy used for evicting entries when the table exceeds its capacity.
+            Default is ``DynamicEmbEvictStrategy.LRU``.
+        local_hbm_for_values : int
+            High-bandwidth memory allocated for local values, in bytes. Default is 0.
+            With ``DynamicEmbeddingShardingPlanner``, this is set to
+            ``ceil(global_hbm_for_values / world_size)`` per rank.
+        device_id : Optional[int], optional
+            CUDA device index.
         training: bool
             Flag to indicate dynamic embedding tables is working on training mode or evaluation mode, default to `True`.
-            If in training mode. **dyanmicemb** store embeddings and optimizer states together in the underlying key-value table. e.g.
+            If in training mode. **dynamicemb** stores embeddings and optimizer states together in the underlying key-value table. e.g.
                 key:torch.int64
                 value = torch.concat(embedding, opt_states, dim=1)
 
-            Therefore, if `training=True` dynamicemb will allocate memory for optimizer states whose consumption is decided by the `optimizer_type` which got from `fused_params`. 
+            Therefore, if `training=True` the module allocates memory for optimizer states; the per-row state size follows the `optimizer` entry in `fused_params` (FBGEMM `EmbOptimType`), as used by `BatchedDynamicEmbeddingTablesV2`.
         initializer_args : DynamicEmbInitializerArgs
             Arguments for initializing dynamic embedding vector values when training, and default using uniform distribution.
-            For `UNIFORM` and `TRUNCATED_NORMAL`, the `lower` and `upper` will set to $\pm {1 \over \sqrt{EmbeddingConfig.num\_embeddings}}$.
+            For ``UNIFORM`` and ``TRUNCATED_NORMAL``, ``lower`` and ``upper`` default to
+            ``±1/sqrt(N)`` where ``N`` is ``EmbeddingConfig.num_embeddings``.
         eval_initializer_args: DynamicEmbInitializerArgs
             The initializer args for evaluation mode, and will return torch.zeros(...) as embedding by default if index/sparse feature is missing.
         caching: bool
@@ -394,13 +466,16 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
                 All keys and other meta data are always stored on GPU for both cases.
         init_capacity : Optional[int], optional
             The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
+            ``BatchedDynamicEmbeddingTablesV2`` also sets ``init_capacity`` to ``max_capacity`` when it is still ``None``.
             If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
-            If set, it will be rounded up to a multiple of DEMB_TABLE_ALIGN_SIZE.
+            With ``DynamicEmbeddingShardingPlanner``, it is rounded up to a multiple of the effective
+            ``bucket_capacity`` in ``_prepare_dynemb_table_options``, then capped at ``max_capacity`` if the aligned value is larger.
             As the `load_factor` of the table increases, its capacity will gradually double (rehash) until it reaches `max_capacity`.
             Rehash will be done implicitly.
             Note: This is the setting for a single table at each rank.
         max_load_factor : float
             The maximum load factor before rehashing occurs. Default is 0.5.
+            In NO_EVICTION mode, this option is ignored: the implementation uses a fixed effective max load factor of 0.5 for the key_index_map (initial sizing and expansion). See the "Table expansion" section for NO_EVICTION trigger conditions.
         score_strategy(DynamicEmbScoreStrategy):
             dynamicemb gives each key-value pair a score to represent its importance.
             Once there is insufficient space, the key-value pair will be evicted based on the score.
@@ -422,6 +497,11 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
             It has different meanings under `caching=True` and  `caching=False`.
                 When `caching=False`, it decides how much GPU memory is in the total memory to store value in a single hybrid table.
                 When `caching=True`, it decides the table capacity of the GPU table.
+            To match planner row counts and optimizer state width, size the **global** budget with
+            ``get_table_value_bytes(embedding_config, EmbOptimType, world_size, bucket_capacity)``
+            (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``MAX_BUCKET_CAPACITY``),
+            then multiply by a cache ratio or scale if desired. The planner overwrites **per-rank**
+            ``local_hbm_for_values`` to ``ceil(global_hbm_for_values / world_size)``.
         external_storage: Storage
             The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
             If not provided, will using DynamicEmbeddingTable as the Storage.
@@ -439,8 +519,15 @@ Dynamic embedding table parameter class, used to configure the parameters for ea
         
         Notes
         -----
-        For detailed descriptions and additional context on each parameter, please refer to the documentation in this repository.
+        See ``DynamicEmb_APIs.md`` (this file) and ``dynamicemb/planner/planner.py`` for planner integration.
         """
+
+        embedding_dtype: Optional[torch.dtype] = None
+        dim: Optional[int] = None
+        max_capacity: Optional[int] = None
+        evict_strategy: DynamicEmbEvictStrategy = DynamicEmbEvictStrategy.LRU
+        local_hbm_for_values: int = 0  # in bytes
+        device_id: Optional[int] = None
 
         training: bool = True
         initializer_args: DynamicEmbInitializerArgs = field(
@@ -815,7 +902,17 @@ Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embeddi
 
 ## Table expansion
 
-Users can specify the initial capacity of a table on a single GPU. When the specified load factor is reached, the capacity of the table will double until the limit is reached. See `init_capacity`, `max_load_factor`, `max_capacity` in `DynamicEmbTableOptions` for more information.
+Users can specify the initial capacity of a table on a single GPU. When the table needs more space, the implementation may double the key_index_map and embedding table capacity (per table, only for tables that need it) before insert. Expansion is triggered in these paths so that insert does not fail for lack of capacity:
+
+- **Prefetch HBM direct**: before inserting admitted keys into `DynamicEmbStorage`.
+- **Cache write-back**: before writing evicted keys back to storage (only `DynamicEmbStorage` uses cache mode; `HybridStorage` does not).
+- **Generic forward (DEFAULT mode)**: before `storage.insert()` when using `DynamicEmbStorage` or `HybridStorage` (for the latter, only the host tier is expanded).
+- **HybridStorage.load**: before inserting keys evicted from HBM into the host tier.
+
+**Trigger conditions:**
+
+- **Non–NO_EVICTION**: When `max_load_factor` would be exceeded or (if set) at `max_capacity`, the table(s) that need it are doubled. See `init_capacity`, `max_load_factor`, `max_capacity` in `DynamicEmbTableOptions`.
+- **NO_EVICTION**: The option `max_load_factor` is not used. The key_index_map is sized and expanded with a fixed effective max load factor of **0.5** (key_index_map capacity = ceil(init_capacity/0.5) at creation; expansion when `needed > table_rows` or `needed > key_index_map.capacity(table_id)`). Both the key_index_map and the embedding buffer are doubled for the affected table(s).
 
 
 ## Dump/Load and Incremental dump
@@ -830,3 +927,13 @@ Please see `DynamicEmbDump`, `DynamicEmbLoad`, `incremental_dump` in [APIs Doc](
 
 When handling cache eviction and final table eviction, dynamicemb encounters randomness in the eviction of keys with the same score. To eliminate this uncertainty, dynamicemb provides a deterministic mode. Enabling this mode ensures that, under the same training script, the evicted keys will be determined.
 This mode is enabled by setting the environment variable `DEMB_DETERMINISM_MODE`.
+
+## Environment Variables
+
+The following environment variables control runtime behavior of dynamicemb:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `DYNAMICEMB_CSTM_SCORE_CHECK` | `1` | When set to `0`, suppresses warnings in `set_score` when a new score is less than the previous one (CUSTOMIZED eviction mode). |
+| `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores during cache eviction and final table eviction. |
+| `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. Copies `segmented_range` to CPU and verifies: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. Raises an error with a descriptive message on violation. Intended for development and testing only; incurs one device-to-host copy per call. |

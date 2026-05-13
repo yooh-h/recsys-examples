@@ -14,11 +14,10 @@
 # limitations under the License.
 
 # pyre-strict
-from typing import Any, Dict, Tuple, Union
+from typing import Dict, Tuple, Union
 
 import torch
 import torch.distributed as dist
-import torchrec
 
 # import our own finalize model grads
 from commons.distributed.finalize_model_grads import finalize_model_grads
@@ -87,7 +86,7 @@ def apply_megatron_ddp(
         overlap_grad_reduce=False,
         use_distributed_optimizer=False,
         check_for_nan_in_grad=False,
-        bucket_size=True,
+        bucket_size=None,
     )
     # MCORE DDP does not broadcast parameters implicitly
     if isinstance(original_model, DistributedModelParallel):

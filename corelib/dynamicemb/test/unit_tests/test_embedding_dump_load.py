@@ -27,8 +27,8 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
-    align_to_table_size,
 )
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dump_load import (
     DynamicEmbDump,
     DynamicEmbLoad,
@@ -38,12 +38,14 @@ from dynamicemb.dump_load import (
 from dynamicemb.dynamicemb_config import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
+    get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
 from dynamicemb.get_planner import get_planner
+from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-from dynamicemb.types import AdmissionStrategy
+from dynamicemb.types import MAX_BUCKET_CAPACITY, AdmissionStrategy
 from dynamicemb.utils import TORCHREC_TYPES
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec import DataType
@@ -82,6 +84,91 @@ def get_score_strategy(score_strategy_str: str) -> DynamicEmbScoreStrategy:
         return DynamicEmbScoreStrategy.LFU
     else:
         raise ValueError(f"Invalid score strategy: {score_strategy_str}")
+
+
+def assert_batched_dynamicemb_storage_class(
+    model,
+    *,
+    caching: bool,
+    global_hbm_budget_scale: float = 1.0,
+) -> None:
+    """Check ``BatchedDynamicEmbeddingTablesV2`` backing storage type.
+
+    - Must be :class:`DynamicEmbStorage` or :class:`HybridStorage`.
+    - With ``--caching``: expect ``DynamicEmbStorage`` (backing store under cache).
+    - No cache and ``global_hbm_budget_scale < 1``: expect ``HybridStorage``
+      (StorageMode DEFAULT / two-tier).
+    - No cache and full budget: expect single-tier ``DynamicEmbStorage``.
+    """
+    for _, _, sharded_module in find_sharded_modules(model, ""):
+        for emb in get_dynamic_emb_module(sharded_module):
+            storage = emb.tables
+            assert isinstance(storage, (DynamicEmbStorage, HybridStorage)), (
+                "BatchedDynamicEmbedding storage must be DynamicEmbStorage or "
+                f"HybridStorage, got {type(storage)}"
+            )
+            if caching:
+                assert isinstance(
+                    storage, DynamicEmbStorage
+                ), f"With --caching, expected DynamicEmbStorage, got {type(storage)}"
+            elif global_hbm_budget_scale < 1.0:
+                assert isinstance(storage, HybridStorage), (
+                    f"With global_hbm_budget_scale={global_hbm_budget_scale} (no cache), "
+                    f"expected HybridStorage, got {type(storage)}"
+                )
+            else:
+                assert isinstance(storage, DynamicEmbStorage), (
+                    "Full HBM budget without cache: expected DynamicEmbStorage, "
+                    f"got {type(storage)}"
+                )
+
+
+def assert_get_dynamic_emb_module_finds_submodules(model) -> None:
+    """Verify get_dynamic_emb_module discovers BatchedDynamicEmbeddingTablesV2.
+
+    Tests two paths:
+      1. Via find_sharded_modules + get_dynamic_emb_module (existing usage)
+      2. Via get_dynamic_emb_module directly on the DMP model (requires
+         children() traversal through wrapper modules, the fix for #353)
+
+    Both must return the same set of modules.
+    """
+    # Path 1: existing approach - find sharded modules first, then search each
+    via_sharded = []
+    for _, _, sharded_module in find_sharded_modules(model, ""):
+        via_sharded.extend(get_dynamic_emb_module(sharded_module))
+
+    # Path 2: search directly on the DMP wrapper (requires children() traversal)
+    via_dmp = get_dynamic_emb_module(model)
+
+    assert (
+        len(via_sharded) > 0
+    ), "find_sharded_modules + get_dynamic_emb_module found no modules"
+    assert (
+        len(via_dmp) > 0
+    ), "get_dynamic_emb_module on DMP model found no modules (children() traversal broken)"
+
+    # Every module found via either path must be BatchedDynamicEmbeddingTablesV2
+    for m in via_sharded:
+        assert isinstance(
+            m, BatchedDynamicEmbeddingTablesV2
+        ), f"Expected BatchedDynamicEmbeddingTablesV2, got {type(m)}"
+    for m in via_dmp:
+        assert isinstance(
+            m, BatchedDynamicEmbeddingTablesV2
+        ), f"Expected BatchedDynamicEmbeddingTablesV2, got {type(m)}"
+
+    # Both paths must discover the exact same set of modules (by identity)
+    ids_sharded = set(id(m) for m in via_sharded)
+    ids_dmp = set(id(m) for m in via_dmp)
+    assert ids_sharded == ids_dmp, (
+        f"Module sets differ: via_sharded has {len(ids_sharded)} modules, "
+        f"via_dmp has {len(ids_dmp)} modules"
+    )
+
+    # No duplicates in either result
+    assert len(via_sharded) == len(ids_sharded), "Duplicates in via_sharded path"
+    assert len(via_dmp) == len(ids_dmp), "Duplicates in via_dmp path"
 
 
 def update_scores(
@@ -186,91 +273,57 @@ class TestModel(nn.Module):
         return torch.cat(embeddings, dim=0)
 
 
-DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
-    DataType.FP32: 32,
-    DataType.FP16: 16,
-    DataType.BF16: 16,
-}
-
-
 def apply_dmp(
     model: torch.nn.Module,
     optimizer_kwargs: Dict[str, Any],
     device: torch.device,
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    dist_type: str = "roundrobin",
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
+    global_hbm_budget_scale: float = 1.0,
 ):
-    eb_configs = []
-    dynamicemb_options_dict = {}
-    for n, m in model.named_modules():
+    eb_configs: List[EmbeddingConfig] = []
+    for _, m in model.named_modules():
         if type(m) in TORCHREC_TYPES:
             eb_configs.extend(m.embedding_configs())
-            for eb_config in eb_configs:
-                dim = eb_config.embedding_dim
-                tmp_type = eb_config.data_type
 
-                embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
-                emb_num_embeddings = (
-                    eb_config.num_embeddings * cache_capacity_ratio
-                    if caching
-                    else eb_config.num_embeddings
-                )
-                emb_num_embeddings_aligned = align_to_table_size(emb_num_embeddings)
+    world_size = dist.get_world_size()
+    dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {}
+    for eb_config in eb_configs:
+        emb_opt_type = (
+            optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
+        ) or EmbOptimType.SGD
 
-                # Calculate optimizer state dimension
-                from dynamicemb.dynamicemb_config import (
-                    data_type_to_dtype,
-                    get_optimizer_state_dim,
-                )
-                from dynamicemb_extensions import OptimizerType
+        value_bytes = get_table_value_bytes(
+            eb_config,
+            emb_opt_type,
+            world_size,
+            MAX_BUCKET_CAPACITY,
+        )
+        if caching:
+            global_hbm = int(value_bytes * cache_capacity_ratio)
+        else:
+            global_hbm = int(value_bytes * global_hbm_budget_scale)
 
-                # Map fbgemm EmbOptimType to dynamicemb OptimizerType
-                emb_opt_type = (
-                    optimizer_kwargs.get("optimizer") if optimizer_kwargs else None
-                )
-                opt_type_map = {
-                    EmbOptimType.EXACT_ROWWISE_ADAGRAD: OptimizerType.RowWiseAdaGrad,
-                    EmbOptimType.SGD: OptimizerType.SGD,
-                    EmbOptimType.EXACT_SGD: OptimizerType.SGD,
-                    EmbOptimType.ADAM: OptimizerType.Adam,
-                    EmbOptimType.EXACT_ADAGRAD: OptimizerType.AdaGrad,
-                }
-                opt_type = opt_type_map.get(emb_opt_type) if emb_opt_type else None
-                # Convert torchrec DataType to torch.dtype
-                torch_dtype = data_type_to_dtype(tmp_type)
-                optimizer_state_dim = (
-                    get_optimizer_state_dim(opt_type, dim, torch_dtype)
-                    if opt_type
-                    else 0
-                )
-
-                # Include optimizer state in HBM calculation
-                total_hbm_need = (
-                    embedding_type_bytes
-                    * (dim + optimizer_state_dim)
-                    * emb_num_embeddings_aligned
-                )
-
-                admission_counter = KVCounter(
-                    max(1024 * 1024, emb_num_embeddings_aligned // 4)
-                )
-                dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
-                    global_hbm_for_values=total_hbm_need,
-                    score_strategy=score_strategy,
-                    initializer_args=DynamicEmbInitializerArgs(
-                        mode=DynamicEmbInitializerMode.CONSTANT,
-                        value=1e-1,
-                    ),
-                    bucket_capacity=emb_num_embeddings_aligned,
-                    max_capacity=emb_num_embeddings_aligned,
-                    caching=caching,
-                    local_hbm_for_values=1024**3,
-                    admit_strategy=admit_strategy,
-                    admission_counter=admission_counter,
-                )
+        admission_counter = KVCounter(
+            max(1024 * 1024, eb_config.num_embeddings // (4 * world_size))
+        )
+        dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
+            global_hbm_for_values=global_hbm,
+            score_strategy=score_strategy,
+            dist_type=dist_type,
+            initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT,
+                value=1e-1,
+            ),
+            bucket_capacity=MAX_BUCKET_CAPACITY,  # keep same to the bucket capacity from get_table_value_bytes
+            caching=caching,
+            admit_strategy=admit_strategy,
+            admission_counter=admission_counter,
+        )
     planner = get_planner(
         eb_configs,
         {},
@@ -305,10 +358,12 @@ def create_model(
     embedding_dim: int,
     optimizer_kwargs: Dict[str, Any],
     score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.LFU,
+    dist_type: str = "roundrobin",
     use_index_dedup: bool = False,
     caching: bool = False,
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
+    global_hbm_budget_scale: float = 1.0,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -341,48 +396,80 @@ def create_model(
         optimizer_kwargs,
         torch.device(f"cuda:{torch.cuda.current_device()}"),
         score_strategy=score_strategy,
+        dist_type=dist_type,
         use_index_dedup=use_index_dedup,
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio,
         admit_strategy=admit_strategy,
+        global_hbm_budget_scale=global_hbm_budget_scale,
     )
     return model
 
 
 def check_counter_table_checkpoint(x, y):
-    device = torch.cuda.current_device()
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
     tables_x = get_dynamic_emb_module(x)
     tables_y = get_dynamic_emb_module(y)
+    assert len(tables_x) == len(tables_y)
 
     for table_x, table_y in zip(tables_x, tables_y):
-        for cnt_tx, cnt_ty in zip(
-            table_x._admission_counter, table_y._admission_counter
-        ):
-            assert cnt_tx.table_.size() == cnt_ty.table_.size()
+        cnt_x = table_x._admission_counter
+        cnt_y = table_y._admission_counter
+        if cnt_x is None:
+            assert cnt_y is None
+            continue
+        assert cnt_x.table_.size() == cnt_y.table_.size()
 
-            for keys, named_scores, _ in cnt_tx._batched_export_keys_scores(
-                cnt_tx.table_.score_names_, torch.device(f"cuda:{device}")
+        freq_name = cnt_x.score_name_
+        for table_id in range(len(table_x._table_names)):
+            for keys, named_scores, _ in cnt_x.table_._batched_export_keys_scores(
+                [freq_name], device, table_id
             ):
                 if keys.numel() == 0:
                     continue
-                freq_name = cnt_tx.table_.score_names_[0]
                 frequencies = named_scores[freq_name]
 
-                score_args_lookup = [
-                    ScoreArg(
-                        name=freq_name,
-                        value=torch.zeros_like(frequencies),
-                        policy=ScorePolicy.CONST,
-                        is_return=True,
-                    )
-                ]
-                founds = torch.empty(
-                    keys.numel(), dtype=torch.bool, device=device
-                ).fill_(False)
+                lookup_table_ids = torch.full(
+                    (keys.numel(),), table_id, dtype=torch.int64, device=device
+                )
+                score_arg_lookup = ScoreArg(
+                    name=freq_name,
+                    value=torch.zeros_like(frequencies),
+                    policy=ScorePolicy.CONST,
+                )
+                score_out, founds, _ = cnt_y.table_.lookup(
+                    keys, lookup_table_ids, score_arg_lookup
+                )
+                assert founds.all(), (
+                    f"counter keys missing from loaded table_id={table_id}: "
+                    f"{keys[~founds].tolist()}"
+                )
+                assert torch.equal(
+                    frequencies, score_out
+                ), f"counter frequency mismatch for table_id={table_id}"
 
-                cnt_ty.lookup(keys, score_args_lookup, founds)
 
-                assert torch.equal(frequencies, score_args_lookup)
+def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
+    seen_sharding = False
+    seen_input_dist = False
+
+    for _, _, sharded_module in find_sharded_modules(model):
+        for sharding in sharded_module._sharding_type_to_sharding.values():
+            if hasattr(sharding, "_dist_type_per_feature"):
+                assert set(sharding._dist_type_per_feature.values()) == {
+                    expected_dist_type
+                }
+                seen_sharding = True
+
+        for input_dist in getattr(sharded_module, "_input_dists", []):
+            if hasattr(input_dist, "_dist_type_per_feature"):
+                assert set(input_dist._dist_type_per_feature.values()) == {
+                    expected_dist_type
+                }
+                seen_input_dist = True
+
+    assert seen_sharding, "Did not find any DynamicEmb sharding carrying dist_type."
+    assert seen_input_dist, "Did not find any input_dist carrying dist_type."
 
 
 @click.command()
@@ -402,6 +489,12 @@ def check_counter_table_checkpoint(x, y):
     type=click.Choice(["timestamp", "step", "lfu"]),
     required=True,
 )
+@click.option(
+    "--dist-type",
+    type=click.Choice(["continuous", "roundrobin", "hash_roundrobin"]),
+    default="roundrobin",
+    show_default=True,
+)
 @click.option("--optim", type=bool, required=True)
 @click.option("--counter", type=bool, required=True)
 def test_model_load_dump(
@@ -411,6 +504,7 @@ def test_model_load_dump(
     embedding_dim: int,
     optimizer_type: str,
     score_strategy: str,
+    dist_type: str,
     mode: str,
     save_path: str,
     optim: bool,
@@ -439,10 +533,13 @@ def test_model_load_dump(
         embedding_dim=embedding_dim,
         optimizer_kwargs=optimizer_kwargs,
         score_strategy=score_strategy_,
+        dist_type=dist_type,
         admit_strategy=FrequencyAdmissionStrategy(
             threshold=2 if counter else 1,
         ),
     )
+
+    assert_get_dynamic_emb_module_finds_submodules(ref_model)
 
     expect_scores_collection: Dict[str, Dict[int, int]] = {}
     kjts, feature_names, all_kjts = generate_sparse_feature(
@@ -457,8 +554,12 @@ def test_model_load_dump(
         scores_collection=expect_scores_collection,
     )
 
+    asserted_ref_dist_type = False
     for kjt in kjts:
         ret = ref_model(kjt)
+        if not asserted_ref_dist_type:
+            assert_dist_type_path(ref_model, dist_type)
+            asserted_ref_dist_type = True
         loss = (
             ret.sum() * dist.get_world_size()
         )  # scale the loss by world size to make the gradients consistent between different gpu settings
@@ -476,6 +577,7 @@ def test_model_load_dump(
             embedding_dim=embedding_dim,
             optimizer_kwargs=optimizer_kwargs,
             score_strategy=score_strategy_,
+            dist_type=dist_type,
             admit_strategy=FrequencyAdmissionStrategy(
                 threshold=2 if counter else 1,
             ),
@@ -491,15 +593,13 @@ def test_model_load_dump(
         for _, _, sharded_module in find_sharded_modules(model):
             dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
             for dynamic_emb_module in dynamic_emb_modules:
-                for table_name, table, counter_table in zip(
-                    dynamic_emb_module.table_names,
-                    dynamic_emb_module.tables,
-                    dynamic_emb_module._admission_counter,
-                ):
+                storage = dynamic_emb_module.tables
+                counter = dynamic_emb_module._admission_counter
+                for table_idx, table_name in enumerate(dynamic_emb_module.table_names):
                     key_to_score = {}
                     visited_keys = set({})
-                    for batched_key, _, _, batched_score in table.export_keys_values(
-                        torch.device(f"cpu")
+                    for batched_key, _, _, batched_score in storage.export_keys_values(
+                        torch.device("cpu"), table_id=table_idx
                     ):
                         for key, score in zip(
                             batched_key.tolist(), batched_score.tolist()
@@ -510,8 +610,10 @@ def test_model_load_dump(
                         keys,
                         named_scores,
                         _,
-                    ) in counter_table.table_._batched_export_keys_scores(
-                        counter_table.table_.score_names_, torch.device(f"cpu")
+                    ) in counter.table_._batched_export_keys_scores(
+                        counter.table_.score_names_,
+                        torch.device("cpu"),
+                        table_id=table_idx,
                     ):
                         if keys.numel() == 0:
                             continue
@@ -579,8 +681,12 @@ def test_model_load_dump(
         model = model.eval()
 
         with torch.inference_mode():
+            asserted_loaded_dist_type = False
             for kjt in kjts:
                 ret = model(kjt)
+                if not asserted_loaded_dist_type:
+                    assert_dist_type_path(model, dist_type)
+                    asserted_loaded_dist_type = True
                 ref_ret = ref_model(kjt)
                 assert torch.allclose(ret, ref_ret)
 

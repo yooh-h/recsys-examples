@@ -25,23 +25,31 @@ from .dynamicemb_config import (
     data_type_to_dtype,
     data_type_to_dyn_emb,
     dyn_emb_to_torch,
+    get_sharded_table_capacity,
+    get_table_value_bytes,
     string_to_evict_strategy,
-    torch_to_dyn_emb,
 )
 from .embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from .optimizer import EmbOptimType, OptimizerArgs
 from .types import (
+    BUCKET_ALIGNMENT,
     DEMB_TABLE_ALIGN_SIZE,
+    MAX_BUCKET_CAPACITY,
     AdmissionStrategy,
     Counter,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
 )
+from .utils import torch_to_dyn_emb
 
 __all__ = [
     "AdmissionStrategy",
+    "BUCKET_ALIGNMENT",
     "DEMB_TABLE_ALIGN_SIZE",
+    "MAX_BUCKET_CAPACITY",
     "align_to_table_size",
+    "get_table_value_bytes",
+    "get_sharded_table_capacity",
     "FrequencyAdmissionStrategy",
     "Counter",
     "KVCounter",
